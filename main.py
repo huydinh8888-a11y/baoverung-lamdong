@@ -1339,29 +1339,42 @@ def get_google_sheet_webhook() -> str:
         return (row[0] or "").strip() if row else ""
 
 
-def _push_to_google_sheet_async(payload: dict):
+def _push_to_google_sheet_sync(payload: dict, override_url: str = "") -> tuple[bool, str]:
     import json as _json
-    import threading as _threading
     import urllib.request as _urlreq
+    import urllib.error as _urlerr
 
-    url = get_google_sheet_webhook()
+    url = (override_url or get_google_sheet_webhook()).strip()
     if not url.startswith(("http://", "https://")):
-        return
+        return False, "Chưa cấu hình đường dẫn Google Sheets Webhook URL."
+    if "/dev" in url:
+        return False, "Bạn đang dán nhầm link thử nghiệm (/dev). Hãy dùng link kết thúc bằng /exec sau khi bấm Triển khai (Deploy)!"
+    try:
+        req = _urlreq.Request(
+            url,
+            data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": "BaoVeRungLamDong/1.0",
+            },
+            method="POST",
+        )
+        with _urlreq.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", errors="ignore").strip()
+            if "<html" in body.lower() and "accounts.google.com" in body.lower():
+                return False, "Google yêu cầu đăng nhập! Hãy vào Apps Script → Triển khai → Quản lý các lần triển khai → sửa 'Ai có quyền truy cập' thành 'Bất kỳ ai (Anyone)'."
+            if body.startswith("ERROR:"):
+                return False, f"Apps Script báo lỗi: {body[:200]}"
+            return True, f"HTTP {resp.status} — Phản hồi từ Google Sheet: {body[:120] or 'OK'}"
+    except _urlerr.HTTPError as he:
+        return False, f"Lỗi HTTP {he.code} từ Google: {he.reason}. Kiểm tra lại quyền 'Bất kỳ ai (Anyone)' và đường dẫn /exec."
+    except Exception as ex:
+        return False, f"Lỗi kết nối Google Sheets: {type(ex).__name__}: {ex}"
 
-    def _worker():
-        try:
-            req = _urlreq.Request(
-                url,
-                data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={"Content-Type": "application/json; charset=utf-8"},
-                method="POST",
-            )
-            with _urlreq.urlopen(req, timeout=10) as resp:
-                resp.read()
-        except Exception:
-            pass
 
-    _threading.Thread(target=_worker, daemon=True).start()
+def _push_to_google_sheet_async(payload: dict):
+    import threading as _threading
+    _threading.Thread(target=_push_to_google_sheet_sync, args=(payload,), daemon=True).start()
 
 
 @app.post("/api/v1/telemetry/ping")
@@ -1421,21 +1434,50 @@ def save_sheet_webhook(webhook_url: str = Form("")):
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (clean_url,),
         )
+    test_ok, test_msg = (False, "Đã xóa Webhook URL.")
+    synced_count = 0
     if clean_url.startswith(("http://", "https://")):
-        _push_to_google_sheet_async({
-            "device_id": "TEST-ADMIN-RENDER",
-            "device_model": "Kiểm tra kết nối từ Web Quản trị Render",
-            "app_version": "v49",
-            "role_status": "Quản trị viên",
-            "officer_name": "Đỗ Huy Định",
-            "unit_name": "Chi cục Kiểm lâm tỉnh Lâm Đồng",
-        })
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            all_devs = conn.execute("SELECT * FROM installed_devices ORDER BY first_seen ASC").fetchall()
+        if all_devs:
+            last_err = ""
+            for dv in all_devs:
+                ok_i, msg_i = _push_to_google_sheet_sync({
+                    "device_id": dv["device_id"],
+                    "device_model": dv["device_model"],
+                    "app_version": dv["app_version"],
+                    "role_status": dv["role_status"],
+                    "officer_name": dv["officer_name"],
+                    "unit_name": dv["unit_name"],
+                    "last_seen": dv["last_seen"],
+                }, override_url=clean_url)
+                if ok_i:
+                    synced_count += 1
+                    test_ok = True
+                    test_msg = f"Đã đồng bộ thành công {synced_count}/{len(all_devs)} máy sang Google Sheets! ({msg_i})"
+                else:
+                    last_err = msg_i
+                    break
+            if not test_ok:
+                test_msg = last_err
+        else:
+            test_ok, test_msg = _push_to_google_sheet_sync({
+                "device_id": "TEST-ADMIN-RENDER",
+                "device_model": "Kiểm tra kết nối từ Web Quản trị Render",
+                "app_version": "1.0",
+                "role_status": "Quản trị viên",
+                "officer_name": "Đỗ Huy Định",
+                "unit_name": "Chi cục Kiểm lâm tỉnh Lâm Đồng",
+            }, override_url=clean_url)
+    color = "#14452F" if test_ok else "#b91c1c"
+    heading = f"Đã kết nối & đồng bộ thành công ({synced_count} máy) sang Google Sheets!" if test_ok else "Chưa ghi được sang Google Sheets — Xem chi tiết lỗi bên dưới"
     return (
         "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
-        "<h2 style='color:#14452F'>Đã lưu đường dẫn đồng bộ Google Sheets!</h2>"
-        f"<p><b>Webhook URL:</b> {clean_url or '(Đã xóa)'}</p>"
-        "<p>Hệ thống đã gửi 1 dòng kiểm tra (TEST-ADMIN-RENDER) sang Google Sheets của bạn. "
-        "Lưu ý: để không mất cấu hình khi Render Free khởi động lại, nên dán thêm link này vào biến môi trường <code>GOOGLE_SHEET_WEBHOOK_URL</code> trong Render → Environment.</p>"
+        f"<h2 style='color:{color}'>{heading}</h2>"
+        f"<p><b>Webhook URL:</b> {clean_url or '(Trống)'}</p>"
+        f"<p><b>Kết quả kiểm tra trực tiếp:</b> {test_msg}</p>"
+        "<p>Lưu ý: để không mất cấu hình khi Render Free khởi động lại, dán link này vào biến môi trường <code>GOOGLE_SHEET_WEBHOOK_URL</code> trong Render → Environment.</p>"
         "<p><a href='/' style='padding:10px 16px;background:#14452F;color:#fff;text-decoration:none;border-radius:6px'>Quay lại Web Quản trị</a></p>"
         "</body></html>"
     )
