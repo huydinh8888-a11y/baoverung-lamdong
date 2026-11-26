@@ -825,6 +825,8 @@ def dashboard():
         sos_rows = conn.execute("SELECT * FROM sos_beacons ORDER BY id DESC LIMIT 5").fetchall()
         officer_rows = conn.execute("SELECT * FROM officer_registrations ORDER BY requested_at DESC").fetchall()
         layer_rows = conn.execute("SELECT * FROM map_layers ORDER BY updated_at DESC").fetchall()
+        init_telemetry_tables()
+        device_rows = conn.execute("SELECT * FROM installed_devices ORDER BY last_seen DESC LIMIT 200").fetchall()
 
     sos_banner = ""
     if sos_rows:
@@ -940,7 +942,7 @@ def dashboard():
             Tháng: <select name="month"><option value="1">Tháng 1</option><option value="2">Tháng 2</option><option value="3">Tháng 3</option><option value="4">Tháng 4</option><option value="5">Tháng 5</option><option value="6">Tháng 6</option><option value="7">Tháng 7</option><option value="8">Tháng 8</option><option value="9">Tháng 9</option><option value="10">Tháng 10</option><option value="11" selected>Tháng 11</option><option value="12">Tháng 12</option></select>
             Năm: <input type="number" name="year" value="2026" min="2026" style="width:75px" required/><br><br>
             <b>Link Tile XYZ (Khuyên dùng cho ảnh ~2GB — cắt XYZ Tiles bằng QGIS, đặt lên klldo/R2):</b>
-            <input name="tile_url" placeholder="https://.../basemap_2026_11/{z}/{x}/{y}.jpg" style="width:360px"/><br><br>
+            <input name="tile_url" placeholder="https://.../basemap_2026_11/{{z}}/{{x}}/{{y}}.jpg" style="width:360px"/><br><br>
             Hoặc tệp ảnh GeoTIFF nhỏ (&lt;100MB, .tif / .tiff): <input type="file" name="geotiff_file" accept=".tif,.tiff"/><br><br>
             Khung tọa độ (nếu GeoTIFF chưa gắn WGS-84) — Bắc: <input name="north_lat" value="12.15" style="width:72px"/>
             Nam: <input name="south_lat" value="11.75" style="width:72px"/>
