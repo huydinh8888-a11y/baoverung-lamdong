@@ -347,6 +347,8 @@ def export_geojson():
         sos_rows = conn.execute("SELECT * FROM sos_beacons ORDER BY id DESC LIMIT 5").fetchall()
         officer_rows = conn.execute("SELECT * FROM officer_registrations ORDER BY requested_at DESC").fetchall()
         layer_rows = conn.execute("SELECT * FROM map_layers ORDER BY updated_at DESC").fetchall()
+        init_telemetry_tables()
+        device_rows = conn.execute("SELECT * FROM installed_devices ORDER BY last_seen DESC LIMIT 200").fetchall()
 
     features = []
     for r in rows:
@@ -494,27 +496,58 @@ def list_map_layers(role: str = "CITIZEN"):
     result = []
     for r in rows:
         d = dict(r)
-        d["download_url"] = f"/maps/{d['filename']}"
+        fn = str(d.get("filename") or "").strip()
+        d["download_url"] = fn if fn.startswith(("http://", "https://")) else f"/maps/{fn}"
         result.append(d)
     return result
 
 
-@app.post("/api/v1/admin/map-layers", dependencies=[Depends(require_admin)])
+def _normalize_external_download_url(raw_url: str) -> str:
+    import re as _re
+    u = raw_url.strip()
+    m = _re.search(r"drive\.google\.com/file/d/([A-Za-z0-9_-]+)", u)
+    if m:
+        return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+    return u
+
+
+@app.post("/api/v1/admin/map-layers", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
 async def upload_map_layer(
     layer_code: str = Form(...),
     title: str = Form(...),
     category: str = Form(...),       # HIEN_TRANG_RUNG / QUY_HOACH_LAM_NGHIEP / RANH_GIOI_TIEU_KHU
     version: str = Form(...),        # VD: v2026.11
     access_level: str = Form("RANGER_ONLY"),  # PUBLIC hoặc RANGER_ONLY
-    mbtiles_file: UploadFile = File(...),
+    external_url: str = Form(""),    # Link tải ngoài cho tệp lớn (>100MB / 2GB): Google Drive, klldo, Cloudflare R2
+    external_size_mb: float = Form(0.0),
+    mbtiles_file: Optional[UploadFile] = File(None),
 ):
-    safe_name = f"{layer_code}_{version}_{Path(mbtiles_file.filename or 'layer.mbtiles').name}"
-    dest = MAPS_DIR / safe_name
-    content = await mbtiles_file.read()
-    dest.write_bytes(content)
-    size_mb = round(len(content) / (1024.0 * 1024.0), 2)
-    now_iso = datetime.now().isoformat(timespec="minutes")
+    ext_link = _normalize_external_download_url(external_url)
+    if ext_link.startswith(("http://", "https://")):
+        stored_name = ext_link
+        size_mb = round(max(0.0, float(external_size_mb or 0.0)), 2)
+    elif mbtiles_file is not None and mbtiles_file.filename:
+        MAPS_DIR.mkdir(parents=True, exist_ok=True)
+        safe_name = f"{layer_code}_{version}_{Path(mbtiles_file.filename).name}"
+        dest = MAPS_DIR / safe_name
+        total_bytes = 0
+        with open(dest, "wb") as out_f:
+            while True:
+                chunk = await mbtiles_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+                total_bytes += len(chunk)
+        stored_name = safe_name
+        size_mb = round(total_bytes / (1024.0 * 1024.0), 2)
+    else:
+        return HTMLResponse(
+            "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+            "<h3 style='color:#b91c1c'>Vui lòng chọn tệp .mbtiles (&lt;100MB) hoặc dán Link tải ngoài (Google Drive / klldo / R2)!</h3>"
+            "<p><a href='/'>Quay lại Web Quản trị</a></p></body></html>"
+        )
 
+    now_iso = datetime.now().isoformat(timespec="minutes")
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -529,9 +562,16 @@ async def upload_map_layer(
                 file_size_mb=excluded.file_size_mb,
                 updated_at=excluded.updated_at
             """,
-            (layer_code, title, category, version, access_level, safe_name, size_mb, now_iso),
+            (layer_code, title, category, version, access_level, stored_name, size_mb, now_iso),
         )
-    return {"status": "OK", "layer_code": layer_code, "version": version, "file_size_mb": size_mb}
+    return (
+        f"<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+        f"<h2 style='color:#14452F'>Đã phát hành lớp bản đồ thành công!</h2>"
+        f"<p><b>Mã lớp:</b> {layer_code} — {title} ({version})</p>"
+        f"<p><b>Nguồn tệp:</b> {stored_name} ({size_mb} MB)</p>"
+        f"<p><a href='/' style='padding:10px 16px;background:#14452F;color:#fff;text-decoration:none;border-radius:6px'>Quay lại Web Quản trị</a></p>"
+        f"</body></html>"
+    )
 
 
 @app.post("/api/v1/projects/plot-center")
@@ -864,8 +904,11 @@ def dashboard():
             Nhóm: <select name="category"><option value="HIEN_TRANG_RUNG">Hiện trạng rừng</option><option value="QUY_HOACH_LAM_NGHIEP">Quy hoạch lâm nghiệp</option><option value="RANH_GIOI_TIEU_KHU">Ranh giới tiểu khu</option></select>
             Phiên bản: <input name="version" value="v2026.11" required/>
             Quyền xem: <select name="access_level"><option value="RANGER_ONLY">Chỉ Cán bộ Kiểm lâm</option><option value="PUBLIC">Công khai toàn dân</option></select>
-            Tệp .mbtiles: <input type="file" name="mbtiles_file" accept=".mbtiles" required/>
-            <button type="submit">Tải lên & Phát hành OTA</button>
+            Tệp .mbtiles (&lt;100MB): <input type="file" name="mbtiles_file" accept=".mbtiles"/><br><br>
+            <b>Hoặc Link tải ngoài (&gt;100MB / 2GB — Google Drive, klldo, Cloudflare R2):</b>
+            <input name="external_url" placeholder="https://drive.google.com/file/d/... hoặc https://klldo/.../ban_do.mbtiles" style="width:360px"/>
+            Dung lượng (MB): <input type="number" step="0.1" name="external_size_mb" value="0" style="width:80px"/>
+            <button type="submit">Phát hành OTA</button>
         </form>
         <table>
             <thead><tr><th>Mã lớp</th><th>Tên bản đồ</th><th>Nhóm</th><th>Phiên bản</th><th>Quyền xem</th><th>Dung lượng</th></tr></thead>
@@ -896,14 +939,33 @@ def dashboard():
             Tên ảnh: <input name="title" value="Ảnh vệ tinh Basemap GeoTIFF Lâm Đồng" required/>
             Tháng: <select name="month"><option value="1">Tháng 1</option><option value="2">Tháng 2</option><option value="3">Tháng 3</option><option value="4">Tháng 4</option><option value="5">Tháng 5</option><option value="6">Tháng 6</option><option value="7">Tháng 7</option><option value="8">Tháng 8</option><option value="9">Tháng 9</option><option value="10">Tháng 10</option><option value="11" selected>Tháng 11</option><option value="12">Tháng 12</option></select>
             Năm: <input type="number" name="year" value="2026" min="2026" style="width:75px" required/><br><br>
-            Tệp ảnh GeoTIFF (.tif / .tiff): <input type="file" name="geotiff_file" accept=".tif,.tiff"/>
-            Link Tile XYZ (tùy chọn): <input name="tile_url" placeholder="https://.../z/x/y.png" style="width:200px"/><br><br>
+            <b>Link Tile XYZ (Khuyên dùng cho ảnh ~2GB — cắt XYZ Tiles bằng QGIS, đặt lên klldo/R2):</b>
+            <input name="tile_url" placeholder="https://.../basemap_2026_11/{z}/{x}/{y}.jpg" style="width:360px"/><br><br>
+            Hoặc tệp ảnh GeoTIFF nhỏ (&lt;100MB, .tif / .tiff): <input type="file" name="geotiff_file" accept=".tif,.tiff"/><br><br>
             Khung tọa độ (nếu GeoTIFF chưa gắn WGS-84) — Bắc: <input name="north_lat" value="12.15" style="width:72px"/>
             Nam: <input name="south_lat" value="11.75" style="width:72px"/>
             Đông: <input name="east_lon" value="108.68" style="width:78px"/>
             Tây: <input name="west_lon" value="108.25" style="width:78px"/>
             <button type="submit">Phát hành Basemap GeoTIFF</button>
         </form>
+        <h2 style="color:#0d47a1;margin-top:28px">Thống kê tự động Thiết bị cài đặt &amp; Đồng bộ Google Sheets</h2>
+        <div style="background:#e3f2fd;padding:14px;border:1px solid #90caf9;margin-bottom:12px">
+            <form method="post" action="/api/v1/admin/save-sheet-webhook" style="margin-bottom:10px">
+                <b>Google Sheets Webhook URL (Apps Script):</b>
+                <input name="webhook_url" value="{get_google_sheet_webhook()}" placeholder="https://script.google.com/macros/s/.../exec" style="width:380px"/>
+                <button type="submit" style="background:#0d47a1;color:#fff;border:none;padding:6px 12px;cursor:pointer">Lưu &amp; Kiểm tra đồng bộ Google Sheet</button>
+                <a href="/api/v1/admin/devices.csv" style="margin-left:10px;padding:6px 12px;background:#1b5e20;color:#fff;text-decoration:none;border-radius:4px">Tải Excel (.csv)</a>
+            </form>
+            <div style="font-size:13px;color:#1e3a5f">
+                <b>Tổng máy ghi nhận:</b> {len(device_rows)} máy &nbsp;|&nbsp;
+                <b>Hoạt động hôm nay:</b> {sum(1 for dv in device_rows if str(dv['last_seen'] or '').startswith(datetime.now().strftime('%Y-%m-%d')))} máy &nbsp;|&nbsp;
+                <b>Đã kích hoạt Kiểm lâm/Chủ rừng:</b> {sum(1 for dv in device_rows if 'Đã kích hoạt' in str(dv['role_status'] or ''))} máy
+            </div>
+        </div>
+        <table>
+            <thead><tr><th>Mã thiết bị</th><th>Dòng máy &amp; Android</th><th>Phiên bản</th><th>Trạng thái</th><th>Cán bộ / Đơn vị</th><th>Hoạt động gần nhất</th><th>Lượt mở</th></tr></thead>
+            <tbody>{"".join(f"<tr><td><b>{dv['device_id']}</b></td><td>{dv['device_model']}</td><td>{dv['app_version']}</td><td>{dv['role_status']}</td><td>{dv['officer_name']} {(' - ' + dv['unit_name']) if dv['unit_name'] else ''}</td><td>{dv['last_seen']}</td><td>{dv['open_count']}</td></tr>" for dv in device_rows) or "<tr><td colspan='7'>Chưa có thiết bị nào gửi tín hiệu thống kê.</td></tr>"}</tbody>
+        </table>
     </body>
     </html>
     """
@@ -1231,3 +1293,170 @@ async def executive_leadership_dashboard(
 </body>
 </html>"""
     return HTMLResponse(content=html)
+
+
+# ==============================================================================
+# THỐNG KÊ TỰ ĐỘNG THIẾT BỊ CÀI ĐẶT & ĐỒNG BỘ GOOGLE SHEETS (BẢN v49)
+# ==============================================================================
+def init_telemetry_tables():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS installed_devices (
+                device_id TEXT PRIMARY KEY,
+                device_model TEXT DEFAULT '',
+                app_version TEXT DEFAULT '',
+                role_status TEXT DEFAULT '',
+                officer_name TEXT DEFAULT '',
+                unit_name TEXT DEFAULT '',
+                first_seen TEXT,
+                last_seen TEXT,
+                open_count INTEGER DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT DEFAULT ''
+            )
+            """
+        )
+
+
+init_telemetry_tables()
+
+
+def get_google_sheet_webhook() -> str:
+    env_url = os.environ.get("GOOGLE_SHEET_WEBHOOK_URL", "").strip()
+    if env_url:
+        return env_url
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'google_sheet_webhook_url'").fetchone()
+        return (row[0] or "").strip() if row else ""
+
+
+def _push_to_google_sheet_async(payload: dict):
+    import json as _json
+    import threading as _threading
+    import urllib.request as _urlreq
+
+    url = get_google_sheet_webhook()
+    if not url.startswith(("http://", "https://")):
+        return
+
+    def _worker():
+        try:
+            req = _urlreq.Request(
+                url,
+                data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
+            with _urlreq.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception:
+            pass
+
+    _threading.Thread(target=_worker, daemon=True).start()
+
+
+@app.post("/api/v1/telemetry/ping")
+def telemetry_ping(
+    device_id: str = Form(...),
+    device_model: str = Form(""),
+    app_version: str = Form("v49"),
+    role_status: str = Form("Người dân (Miễn phí)"),
+    officer_name: str = Form(""),
+    unit_name: str = Form(""),
+):
+    init_telemetry_tables()
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    dev_id = device_id.strip()[:64]
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT open_count FROM installed_devices WHERE device_id = ?", (dev_id,)).fetchone()
+        if row:
+            conn.execute(
+                """
+                UPDATE installed_devices
+                SET device_model = ?, app_version = ?, role_status = ?,
+                    officer_name = CASE WHEN ? != '' THEN ? ELSE officer_name END,
+                    unit_name = CASE WHEN ? != '' THEN ? ELSE unit_name END,
+                    last_seen = ?, open_count = open_count + 1
+                WHERE device_id = ?
+                """,
+                (device_model, app_version, role_status, officer_name, officer_name, unit_name, unit_name, now_iso, dev_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO installed_devices (device_id, device_model, app_version, role_status, officer_name, unit_name, first_seen, last_seen, open_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (dev_id, device_model, app_version, role_status, officer_name, unit_name, now_iso, now_iso),
+            )
+
+    _push_to_google_sheet_async({
+        "device_id": dev_id,
+        "device_model": device_model,
+        "app_version": app_version,
+        "role_status": role_status,
+        "officer_name": officer_name,
+        "unit_name": unit_name,
+        "last_seen": now_iso,
+    })
+    return {"status": "OK", "device_id": dev_id}
+
+
+@app.post("/api/v1/admin/save-sheet-webhook", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
+def save_sheet_webhook(webhook_url: str = Form("")):
+    init_telemetry_tables()
+    clean_url = webhook_url.strip()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('google_sheet_webhook_url', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (clean_url,),
+        )
+    if clean_url.startswith(("http://", "https://")):
+        _push_to_google_sheet_async({
+            "device_id": "TEST-ADMIN-RENDER",
+            "device_model": "Kiểm tra kết nối từ Web Quản trị Render",
+            "app_version": "v49",
+            "role_status": "Quản trị viên",
+            "officer_name": "Đỗ Huy Định",
+            "unit_name": "Chi cục Kiểm lâm tỉnh Lâm Đồng",
+        })
+    return (
+        "<html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
+        "<h2 style='color:#14452F'>Đã lưu đường dẫn đồng bộ Google Sheets!</h2>"
+        f"<p><b>Webhook URL:</b> {clean_url or '(Đã xóa)'}</p>"
+        "<p>Hệ thống đã gửi 1 dòng kiểm tra (TEST-ADMIN-RENDER) sang Google Sheets của bạn. "
+        "Lưu ý: để không mất cấu hình khi Render Free khởi động lại, nên dán thêm link này vào biến môi trường <code>GOOGLE_SHEET_WEBHOOK_URL</code> trong Render → Environment.</p>"
+        "<p><a href='/' style='padding:10px 16px;background:#14452F;color:#fff;text-decoration:none;border-radius:6px'>Quay lại Web Quản trị</a></p>"
+        "</body></html>"
+    )
+
+
+@app.get("/api/v1/admin/devices.csv", dependencies=[Depends(require_admin)])
+def export_devices_csv():
+    import csv as _csv
+    import io as _io
+    from fastapi.responses import Response as _Resp
+
+    init_telemetry_tables()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM installed_devices ORDER BY last_seen DESC").fetchall()
+    buf = _io.StringIO()
+    buf.write("\ufeff")
+    w = _csv.writer(buf)
+    w.writerow(["Mã thiết bị", "Dòng máy & Android", "Phiên bản", "Trạng thái", "Cán bộ", "Đơn vị", "Cài lần đầu", "Hoạt động gần nhất", "Tổng lượt mở"])
+    for r in rows:
+        w.writerow([r["device_id"], r["device_model"], r["app_version"], r["role_status"], r["officer_name"], r["unit_name"], r["first_seen"], r["last_seen"], r["open_count"]])
+    return _Resp(
+        content=buf.getvalue().encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=ThongKe_ThietBi_BaoVeRung.csv"},
+    )
