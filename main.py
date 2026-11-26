@@ -117,16 +117,8 @@ def init_fire_table():
             )
             """
         )
-        # Chèn 1 điểm mẫu khu vực Lâm Đồng nếu bảng còn trống để cán bộ kiểm thử ngay
-        count = conn.execute("SELECT COUNT(*) FROM fire_alerts").fetchone()[0]
-        if count == 0:
-            conn.execute(
-                """
-                INSERT INTO fire_alerts (location_name, latitude, longitude, vn2000_x, vn2000_y, confidence, source, detected_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                ("Tiểu khu 144B - Khu vực Đà Lạt (Điểm mẫu kiểm thử)", 11.9652, 108.4810, 1323120.5, 579640.2, "Cao (85%)", "VIIRS/Sentinel-2", datetime.now().isoformat(timespec="minutes")),
-            )
+        # Xóa sạch mọi điểm cháy mẫu giả định cũ — chỉ giữ điểm cháy thực tế
+        conn.execute("DELETE FROM fire_alerts WHERE location_name LIKE '%Điểm mẫu kiểm thử%' OR location_name LIKE '%144B - Khu vực Đà Lạt%'")
 
 
 init_sos_table()
@@ -256,7 +248,7 @@ def init_legal_table():
                 ("16/2017/QH14", "Luật Lâm nghiệp", "Luật", "Quy định quản lý, bảo vệ, phát triển, sử dụng rừng, chế biến và thương mại lâm sản.", "", "", now_iso),
                 ("156/2018/NĐ-CP", "Nghị định quy định chi tiết thi hành một số điều của Luật Lâm nghiệp", "Nghị định", "Quy định phân loại rừng, chuyển mục đích sử dụng rừng, DVMTR và tổ chức Kiểm lâm.", "", "", now_iso),
                 ("91/2024/NĐ-CP", "Nghị định sửa đổi, bổ sung một số điều của Nghị định 156/2018/NĐ-CP", "Nghị định", "Cập nhật quy định chuyển mục đích sử dụng rừng, tạm sử dụng rừng và trồng rừng thay thế.", "", "", now_iso),
-                ("33/2018/TT-BNNPTNT", "Thông tư quy định về điều tra, kiểm kê và theo dõi diễn biến rừng", "Thông tư", "Hướng dẫn phương pháp lập ÔTC, đo đếm lâm phần và mẫu biểu điều tra kiểm kê rừng.", "", "", now_iso),
+                ("16/2025/TT-BNNMT", "Thông tư phân quyền, phân cấp và nội dung lâm nghiệp, kiểm lâm (thay thế TT 33/2018)", "Thông tư", "Quy định phân quyền, phân cấp, theo dõi diễn biến rừng và trồng rừng thay thế.", "", "", now_iso),
             ]
             conn.executemany(
                 "INSERT INTO legal_documents (doc_symbol, title, doc_type, summary, doc_url, filename, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -843,7 +835,8 @@ def dashboard():
         </style>
     </head>
     <body>
-        <h1>Trung tâm Tiếp nhận Tin báo Toàn dân Bảo vệ Rừng</h1>
+        <div style="margin-bottom:8px"><a href="/dashboard-lanh-dao" style="background:#f59e0b;color:#000;padding:6px 12px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:13px">📊 Mở Dashboard Điều hành Lãnh đạo (Vụ việc phân cấp)</a></div>
+<h1>Trung tâm Tiếp nhận Tin báo Toàn dân Bảo vệ Rừng</h1>
         {sos_banner}
         <a class="btn-geo" href="/api/v1/reports.geojson" target="_blank">Tải lớp điểm GeoJSON (mở trên QGIS / MapInfo)</a>
         <table>
@@ -880,7 +873,7 @@ def dashboard():
         </table>
         <h2 style="color:#bf360c;margin-top:28px">Đăng Điểm cảnh báo cháy rừng mới</h2>
         <form method="post" action="/api/v1/fire-alerts" style="background:#fff3e0;padding:14px;border:1px solid #ffcc80;margin-bottom:12px">
-            Vị trí / Tiểu khu: <input name="location_name" value="Tiểu khu 144B - Đà Lạt" required/>
+            Vị trí / Tiểu khu: <input name="location_name" placeholder="VD: Tiểu khu 144B - Đà Lạt" required/>
             Lat: <input name="latitude" value="11.9652" style="width:90px" required/>
             Lon: <input name="longitude" value="108.4810" style="width:90px" required/>
             VN2000 X(E): <input name="vn2000_y" value="579640.2" style="width:95px"/>
@@ -914,3 +907,327 @@ def dashboard():
     </body>
     </html>
     """
+
+
+# ==============================================================================
+# HỒ SƠ VỤ VIỆC PHÂN CẤP & BẢNG ĐIỀU HÀNH LÃNH ĐẠO (CHI CỤC / HẠT / BAN QLR)
+# ==============================================================================
+LEVEL_LABELS = {
+    "CO_SO": "Cơ sở / Kiểm lâm địa bàn",
+    "TRUONG_BAN": "Trưởng Ban QLR / Trạm trưởng",
+    "HAT_TRUONG": "Hạt trưởng Hạt Kiểm lâm",
+    "CHI_CUC": "Lãnh đạo Chi cục Kiểm lâm",
+}
+STATUS_LABELS = {
+    "MOI_TIEP_NHAN": "Mới tiếp nhận",
+    "DANG_XAC_MINH": "Đang xác minh hiện trường",
+    "DA_LAP_BIEN_BAN": "Đã lập biên bản",
+    "DA_XU_LY": "Đã xử lý xong",
+}
+
+
+def init_cases_table():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS incident_cases (
+                case_code TEXT PRIMARY KEY,
+                title TEXT,
+                incident_type TEXT,
+                urgency TEXT DEFAULT 'CAO',
+                unit_name TEXT,
+                location_text TEXT,
+                latitude REAL DEFAULT 0.0,
+                longitude REAL DEFAULT 0.0,
+                vn2000_x REAL DEFAULT 0.0,
+                vn2000_y REAL DEFAULT 0.0,
+                area_ha REAL DEFAULT 0.0,
+                timber_m3 REAL DEFAULT 0.0,
+                description TEXT DEFAULT '',
+                forces_deployed TEXT DEFAULT '',
+                reporter_name TEXT DEFAULT '',
+                current_level TEXT DEFAULT 'HAT_TRUONG',
+                status TEXT DEFAULT 'MOI_TIEP_NHAN',
+                directive_note TEXT DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+
+
+init_cases_table()
+
+
+@app.get("/api/v1/cases")
+async def list_incident_cases(
+    unit: Optional[str] = None,
+    level: Optional[str] = None,
+    status_filter: Optional[str] = None,
+):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        q = "SELECT * FROM incident_cases WHERE 1=1"
+        params = []
+        if unit:
+            q += " AND unit_name LIKE ?"
+            params.append(f"%{unit}%")
+        if level:
+            q += " AND current_level = ?"
+            params.append(level)
+        if status_filter:
+            q += " AND status = ?"
+            params.append(status_filter)
+        q += " ORDER BY updated_at DESC"
+        rows = [dict(r) for r in conn.execute(q, params).fetchall()]
+    return rows
+
+
+@app.post("/api/v1/cases")
+async def create_incident_case(
+    case_code: str = Form(""),
+    title: str = Form(...),
+    incident_type: str = Form("Phá rừng trái pháp luật"),
+    urgency: str = Form("CAO"),
+    unit_name: str = Form("Hạt Kiểm lâm Đà Lạt"),
+    location_text: str = Form(""),
+    latitude: float = Form(0.0),
+    longitude: float = Form(0.0),
+    vn2000_x: float = Form(0.0),
+    vn2000_y: float = Form(0.0),
+    area_ha: float = Form(0.0),
+    timber_m3: float = Form(0.0),
+    description: str = Form(""),
+    forces_deployed: str = Form(""),
+    reporter_name: str = Form("Cán bộ Kiểm lâm"),
+    current_level: str = Form("HAT_TRUONG"),
+    status_val: str = Form("MOI_TIEP_NHAN"),
+):
+    code = case_code.strip() or f"VV-{datetime.now().strftime('%y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO incident_cases (
+                case_code, title, incident_type, urgency, unit_name, location_text,
+                latitude, longitude, vn2000_x, vn2000_y, area_ha, timber_m3,
+                description, forces_deployed, reporter_name, current_level, status,
+                directive_note, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+            """,
+            (
+                code, title.strip(), incident_type.strip(), urgency.strip(), unit_name.strip(),
+                location_text.strip(), latitude, longitude, vn2000_x, vn2000_y, area_ha,
+                timber_m3, description.strip(), forces_deployed.strip(), reporter_name.strip(),
+                current_level.strip(), status_val.strip(), now_iso, now_iso
+            ),
+        )
+    return {"server_id": code, "status": status_val, "message": f"Đã tiếp nhận hồ sơ vụ việc {code}"}
+
+
+@app.post("/api/v1/cases/{case_code}/update")
+async def update_incident_case(
+    case_code: str,
+    current_level: str = Form(...),
+    status_val: str = Form(...),
+    directive_note: str = Form(""),
+):
+    now_iso = datetime.now().strftime("%Y-%m-%d %H:%M")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            UPDATE incident_cases
+            SET current_level = ?, status = ?, directive_note = ?, updated_at = ?
+            WHERE case_code = ?
+            """,
+            (current_level.strip(), status_val.strip(), directive_note.strip(), now_iso, case_code),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Không tìm thấy mã vụ việc")
+    return {"server_id": case_code, "status": status_val, "message": f"Đã cập nhật hồ sơ {case_code}"}
+
+
+@app.get("/dashboard-lanh-dao", response_class=HTMLResponse)
+async def executive_leadership_dashboard(
+    unit: str = "",
+    level: str = "",
+    admin_user: str = Depends(require_admin),
+):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        q = "SELECT * FROM incident_cases WHERE 1=1"
+        params = []
+        if unit:
+            q += " AND unit_name = ?"
+            params.append(unit)
+        if level:
+            q += " AND current_level = ?"
+            params.append(level)
+        q += " ORDER BY updated_at DESC"
+        cases = [dict(r) for r in conn.execute(q, params).fetchall()]
+        all_units = [r[0] for r in conn.execute("SELECT DISTINCT unit_name FROM incident_cases ORDER BY unit_name").fetchall() if r[0]]
+        unit_stats = [
+            dict(r) for r in conn.execute(
+                """
+                SELECT unit_name,
+                       COUNT(*) AS total_cases,
+                       SUM(CASE WHEN urgency = 'KHAN_CAP' THEN 1 ELSE 0 END) AS urgent_cases,
+                       SUM(CASE WHEN status = 'DA_XU_LY' THEN 1 ELSE 0 END) AS done_cases,
+                       ROUND(SUM(area_ha), 4) AS sum_ha,
+                       ROUND(SUM(timber_m3), 3) AS sum_m3
+                FROM incident_cases
+                GROUP BY unit_name
+                ORDER BY total_cases DESC
+                """
+            ).fetchall()
+        ]
+
+    total_cases = len(cases)
+    pending_cases = sum(1 for c in cases if c["status"] != "DA_XU_LY")
+    total_ha = sum(c["area_ha"] or 0.0 for c in cases)
+    total_m3 = sum(c["timber_m3"] or 0.0 for c in cases)
+
+    markers_js = json.dumps([
+        {
+            "code": c["case_code"],
+            "title": c["title"],
+            "type": c["incident_type"],
+            "unit": c["unit_name"],
+            "lat": c["latitude"],
+            "lon": c["longitude"],
+            "x": round(c["vn2000_y"] or 0.0, 1),
+            "y": round(c["vn2000_x"] or 0.0, 1),
+            "urgency": c["urgency"],
+            "status": STATUS_LABELS.get(c["status"], c["status"]),
+            "level": LEVEL_LABELS.get(c["current_level"], c["current_level"]),
+        }
+        for c in cases if (c["latitude"] or 0) != 0 and (c["longitude"] or 0) != 0
+    ], ensure_ascii=False)
+
+    unit_options = '<option value="">-- Tất cả Hạt / Ban QLR --</option>' + "".join(
+        f'<option value="{u}" {"selected" if u == unit else ""}>{u}</option>' for u in all_units
+    )
+    level_options = '<option value="">-- Tất cả cấp chỉ huy --</option>' + "".join(
+        f'<option value="{k}" {"selected" if k == level else ""}>{v}</option>' for k, v in LEVEL_LABELS.items()
+    )
+
+    stats_rows = "".join(
+        f"<tr><td><b>{s['unit_name']}</b></td><td>{s['total_cases']}</td><td style='color:#c62828;font-weight:bold'>{s['urgent_cases']}</td>"
+        f"<td style='color:#2e7d32;font-weight:bold'>{s['done_cases']}</td><td>{s['sum_ha'] or 0:.4f} ha</td><td>{s['sum_m3'] or 0:.3f} m³</td></tr>"
+        for s in unit_stats
+    ) or "<tr><td colspan='6' style='text-align:center;color:#666'>Chưa có hồ sơ vụ việc nào được gửi lên.</td></tr>"
+
+    case_rows = ""
+    for c in cases:
+        urg_color = "#c62828" if c["urgency"] == "KHAN_CAP" else ("#ef6c00" if c["urgency"] == "CAO" else "#1565c0")
+        lvl_opts_row = "".join(
+            f'<option value="{k}" {"selected" if k == c["current_level"] else ""}>{v}</option>'
+            for k, v in LEVEL_LABELS.items()
+        )
+        st_opts_row = "".join(
+            f'<option value="{k}" {"selected" if k == c["status"] else ""}>{v}</option>'
+            for k, v in STATUS_LABELS.items()
+        )
+        case_rows += f"""
+        <tr>
+          <td><b>{c['case_code']}</b><br><span style='font-size:11px;color:#555'>{c['updated_at']}</span></td>
+          <td><b style='color:#14452f'>{c['title']}</b><br><span style='font-size:12px'>{c['incident_type']} • {c['location_text']}</span><br>
+              <span style='font-size:11px;color:#444'>VN-2000: X={c['vn2000_y']:.1f}, Y={c['vn2000_x']:.1f} | {c['area_ha']:.4f} ha | {c['timber_m3']:.3f} m³</span></td>
+          <td>{c['unit_name']}<br><span style='color:{urg_color};font-weight:bold;font-size:11px'>{c['urgency']}</span></td>
+          <td>
+            <form method="post" action="/api/v1/cases/{c['case_code']}/update" onsubmit="setTimeout(()=>location.reload(), 400)">
+              <select name="current_level" style="width:100%;margin-bottom:4px;padding:3px">{lvl_opts_row}</select>
+              <select name="status_val" style="width:100%;margin-bottom:4px;padding:3px">{st_opts_row}</select>
+              <input name="directive_note" value="{(c['directive_note'] or '').replace('"', '&quot;')}" placeholder="Ý kiến chỉ đạo của lãnh đạo..." style="width:96%;margin-bottom:4px;padding:4px"/>
+              <button type="submit" style="background:#14452f;color:#fff;border:none;padding:4px 10px;border-radius:4px;cursor:pointer">Lưu chỉ đạo</button>
+            </form>
+          </td>
+        </tr>
+        """
+    if not case_rows:
+        case_rows = "<tr><td colspan='4' style='text-align:center;color:#666;padding:18px'>Chưa có hồ sơ vụ việc nào. Hãy tạo hồ sơ từ ứng dụng Android mục Hồ sơ vụ việc & Báo cáo phân cấp.</td></tr>"
+
+    html = f"""<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8"/>
+<title>Bảng Điều Hành Lãnh Đạo — Chi cục Kiểm lâm tỉnh Lâm Đồng</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0; background: #f3f7f4; color: #1b2e22; }}
+  header {{ background: #14452f; color: #fff; padding: 14px 24px; display: flex; justify-content: space-between; align-items: center; }}
+  header a {{ color: #f59e0b; text-decoration: none; font-weight: bold; }}
+  .wrap {{ max-width: 1280px; margin: 18px auto; padding: 0 16px; }}
+  .kpis {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }}
+  .kpi {{ background: #fff; padding: 14px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); border-left: 5px solid #14452f; }}
+  .kpi h4 {{ margin: 0 0 6px 0; font-size: 12px; color: #555; text-transform: uppercase; }}
+  .kpi .val {{ font-size: 24px; font-weight: 800; color: #14452f; }}
+  .card {{ background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); margin-bottom: 16px; }}
+  #map {{ height: 340px; border-radius: 10px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th, td {{ border-bottom: 1px solid #e0e7e2; padding: 8px; text-align: left; vertical-align: top; }}
+  th {{ background: #e8f5e9; color: #14452f; }}
+  .filters {{ display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }}
+  select, button {{ padding: 6px 10px; border-radius: 6px; border: 1px solid #cbd5e1; }}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div style="font-size:18px;font-weight:800">BẢNG ĐIỀU HÀNH LÃNH ĐẠO — HỒ SƠ VỤ VIỆC PHÂN CẤP</div>
+    <div style="font-size:12px;color:#c8e6c9">Sở Nông nghiệp và Môi trường tỉnh Lâm Đồng • Chi cục Kiểm lâm • Tài khoản: {admin_user}</div>
+  </div>
+  <a href="/admin">← Quay lại Cổng Quản trị</a>
+</header>
+<div class="wrap">
+  <div class="kpis">
+    <div class="kpi"><h4>Tổng hồ sơ vụ việc</h4><div class="val">{total_cases}</div></div>
+    <div class="kpi" style="border-left-color:#c62828"><h4>Đang xử lý / Chờ chỉ đạo</h4><div class="val" style="color:#c62828">{pending_cases}</div></div>
+    <div class="kpi" style="border-left-color:#ef6c00"><h4>Tổng diện tích thiệt hại</h4><div class="val" style="color:#ef6c00">{total_ha:.4f} ha</div></div>
+    <div class="kpi" style="border-left-color:#0d47a1"><h4>Tổng khối lượng gỗ</h4><div class="val" style="color:#0d47a1">{total_m3:.3f} m³</div></div>
+  </div>
+  <div class="card">
+    <form class="filters" method="get" action="/dashboard-lanh-dao">
+      <b>Lọc điều hành:</b>
+      <select name="unit">{unit_options}</select>
+      <select name="level">{level_options}</select>
+      <button type="submit" style="background:#14452f;color:#fff;border:none;cursor:pointer">Lọc dữ liệu</button>
+      <a href="/dashboard-lanh-dao" style="font-size:12px;color:#555">Xóa lọc</a>
+    </form>
+    <div id="map"></div>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0;color:#14452f">Thống kê vụ việc theo từng Hạt Kiểm lâm / Ban QLR</h3>
+    <table>
+      <thead><tr><th>Đơn vị phụ trách</th><th>Tổng vụ</th><th>Khẩn cấp</th><th>Đã xử lý</th><th>Tổng diện tích</th><th>Tổng gỗ</th></tr></thead>
+      <tbody>{stats_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0;color:#14452f">Danh sách Hồ sơ vụ việc & Phân cấp chỉ đạo</h3>
+    <table>
+      <thead><tr><th>Mã vụ / Thời gian</th><th>Nội dung & Tọa độ VN-2000</th><th>Đơn vị / Mức độ</th><th style="width:270px">Phân cấp & Ý kiến chỉ đạo</th></tr></thead>
+      <tbody>{case_rows}</tbody>
+    </table>
+  </div>
+</div>
+<script>
+  const map = L.map('map').setView([11.9404, 108.4583], 10);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+    attribution: 'Esri Satellite'
+  }}).addTo(map);
+  const pts = {markers_js};
+  pts.forEach(p => {{
+    const color = p.urgency === 'KHAN_CAP' ? '#c62828' : (p.urgency === 'CAO' ? '#ef6c00' : '#1565c0');
+    L.circleMarker([p.lat, p.lon], {{ radius: 9, fillColor: color, color: '#fff', weight: 2, fillOpacity: 0.9 }})
+      .addTo(map)
+      .bindPopup(`<b>${{p.code}} - ${{p.title}}</b><br>${{p.type}} • ${{p.unit}}<br>Cấp: ${{p.level}} | ${{p.status}}<br>VN-2000: X=${{p.x}}, Y=${{p.y}}`);
+  }});
+  if (pts.length > 0) {{
+    map.fitBounds(pts.map(p => [p.lat, p.lon]), {{ padding: [30, 30], maxZoom: 14 }});
+  }}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
