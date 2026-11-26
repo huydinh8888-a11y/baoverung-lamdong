@@ -1350,14 +1350,19 @@ def _push_to_google_sheet_sync(payload: dict, override_url: str = "") -> tuple[b
     if "/dev" in url:
         return False, "Bạn đang dán nhầm link thử nghiệm (/dev). Hãy dùng link kết thúc bằng /exec sau khi bấm Triển khai (Deploy)!"
     try:
+        # Lưu ý kỹ thuật với Google Apps Script:
+        # KHÔNG đặt method="POST" cứng trên Request vì urllib sẽ giữ nguyên POST khi theo chuyển hướng 302
+        # sang script.googleusercontent.com (khiến Google trả 403/405). Khi truyền data=... không gán method,
+        # urllib tự gửi POST lần 1 (chạy doPost) và tự chuyển sang GET ở bước 302!
+        raw_bytes = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = _urlreq.Request(
             url,
-            data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=raw_bytes,
             headers={
                 "Content-Type": "application/json; charset=utf-8",
-                "User-Agent": "BaoVeRungLamDong/1.0",
+                "Accept": "*/*",
+                "User-Agent": "Mozilla/5.0 (compatible; GoogleAppsScriptSync/1.0)",
             },
-            method="POST",
         )
         with _urlreq.urlopen(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", errors="ignore").strip()
